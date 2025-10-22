@@ -223,3 +223,100 @@ class ClassifierFactory:
         classifier.loaded = True
         
         return classifier
+
+
+class MockClassifier(RequestClassifierInterface):
+    """Mock classifier for testing and fallback scenarios"""
+    
+    def __init__(self):
+        self.loaded = True
+        self.model_info = {
+            "status": "loaded",
+            "type": "mock",
+            "version": "1.0.0"
+        }
+    
+    def is_loaded(self) -> bool:
+        return self.loaded
+    
+    def get_model_info(self) -> Dict[str, Any]:
+        return self.model_info
+    
+    async def load_model(self, model_path: str = None) -> bool:
+        """Mock load model - always returns True"""
+        self.loaded = True
+        return True
+    
+    def get_confidence_score(self, utterance: str, predicted_class: str) -> float:
+        """Mock confidence score calculation"""
+        return 0.8
+    
+    def train_model(self, dataset_path: str, model_save_path: str = None):
+        """Mock training - returns dummy metrics"""
+        from ..types import ModelMetrics, RequestType
+        return ModelMetrics(
+            accuracy=0.95,
+            precision={RequestType.CANCEL_TRIP: 0.95, RequestType.FLIGHT_STATUS: 0.95},
+            recall={RequestType.CANCEL_TRIP: 0.95, RequestType.FLIGHT_STATUS: 0.95},
+            f1_score={RequestType.CANCEL_TRIP: 0.95, RequestType.FLIGHT_STATUS: 0.95},
+            confusion_matrix=[[10, 0], [0, 10]]
+        )
+    
+    async def classify_request(self, utterance: str) -> ClassificationResult:
+        """Simple keyword-based classification for mock"""
+        from ..types import RequestType, ClassificationResult, ExtractedEntity, EntityType
+        
+        utterance_lower = utterance.lower()
+        
+        # Simple keyword matching
+        if any(word in utterance_lower for word in ["cancel", "refund", "cancellation"]):
+            request_type = RequestType.CANCEL_TRIP
+            confidence = 0.8
+        elif any(word in utterance_lower for word in ["status", "delayed", "on time", "departure"]):
+            request_type = RequestType.FLIGHT_STATUS
+            confidence = 0.8
+        elif any(word in utterance_lower for word in ["seat", "upgrade", "available"]):
+            request_type = RequestType.SEAT_AVAILABILITY
+            confidence = 0.8
+        elif any(word in utterance_lower for word in ["policy", "rules", "terms"]):
+            request_type = RequestType.CANCELLATION_POLICY
+            confidence = 0.8
+        elif any(word in utterance_lower for word in ["pet", "animal", "dog", "cat"]):
+            request_type = RequestType.PET_TRAVEL
+            confidence = 0.8
+        else:
+            request_type = RequestType.UNKNOWN
+            confidence = 0.3
+        
+        # Simple entity extraction
+        entities = []
+        
+        # Look for PNR patterns (6 characters alphanumeric)
+        import re
+        pnr_matches = re.findall(r'\b[A-Z0-9]{6}\b', utterance.upper())
+        for match in pnr_matches:
+            entities.append(ExtractedEntity(
+                type=EntityType.PNR,
+                value=match,
+                confidence=0.9,
+                start_index=utterance.upper().find(match),
+                end_index=utterance.upper().find(match) + len(match)
+            ))
+        
+        # Look for flight numbers (2-3 letters + 3-4 digits)
+        flight_matches = re.findall(r'\b[A-Z]{2,3}\s*\d{3,4}\b', utterance.upper())
+        for match in flight_matches:
+            entities.append(ExtractedEntity(
+                type=EntityType.FLIGHT_NUMBER,
+                value=match.replace(' ', ''),
+                confidence=0.9,
+                start_index=utterance.upper().find(match),
+                end_index=utterance.upper().find(match) + len(match)
+            ))
+        
+        return ClassificationResult(
+            request_type=request_type,
+            confidence=confidence,
+            alternative_intents=[],
+            extracted_entities=entities
+        )
