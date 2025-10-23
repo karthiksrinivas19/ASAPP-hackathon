@@ -88,10 +88,16 @@ class WorkflowDefinitionRegistry:
                 dependencies=["extract_identifiers"]
             ),
             TaskDefinition(
+                task_id="confirm_booking_details",
+                task_type=TaskType.INFORM_CUSTOMER,
+                parameters={"response_type": "booking_confirmation", "require_confirmation": True},
+                dependencies=["get_booking_details"]
+            ),
+            TaskDefinition(
                 task_id="cancel_flight",
                 task_type=TaskType.API_CALL,
                 parameters={"api_method": "cancel_flight", "required_data": ["booking_details"]},
-                dependencies=["get_booking_details"]
+                dependencies=["confirm_booking_details"]
             ),
             TaskDefinition(
                 task_id="inform_cancellation_result",

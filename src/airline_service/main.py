@@ -12,7 +12,7 @@ import structlog
 from datetime import datetime
 
 from .config import config
-from .types import CustomerRequest, APIResponse, RequestType
+from .types import CustomerRequest, APIResponse, RequestType, RequestContext
 from .services import (
     audit_logger, performance_monitor, metrics_collector, MetricType,
     cache_service, connection_pool_manager, health_monitor
@@ -450,21 +450,40 @@ async def process_customer_query(request: CustomerRequest):
                 )
             )
         
-        # 2. Get Services from Container with Graceful Degradation
+        # 2. Get Services from Container
         try:
             if not container.is_initialized():
                 logger.error("Service container not initialized", session_id=session_id)
-                # Try graceful degradation for classifier
-                return APIResponse(**(await GracefulDegradationHandler.handle_classifier_unavailable(request.utterance)))
+                raise HTTPException(
+                    status_code=503,
+                    detail=ErrorHandler.create_error_response(
+                        status_code=503,
+                        message="Service temporarily unavailable - container not initialized",
+                        error_code=ErrorCode.SERVICE_UNAVAILABLE,
+                        session_id=session_id,
+                        request_id=request_id
+                    )
+                )
             
             # Get services from dependency injection container
             classifier = container.get_classifier()
             workflow_orchestrator = container.get_workflow_orchestrator()
             
             if not classifier.is_loaded():
-                logger.warning("Classifier not loaded, using graceful degradation", session_id=session_id)
-                return APIResponse(**(await GracefulDegradationHandler.handle_classifier_unavailable(request.utterance)))
+                logger.error("Classifier not loaded", session_id=session_id)
+                raise HTTPException(
+                    status_code=503,
+                    detail=ErrorHandler.create_error_response(
+                        status_code=503,
+                        message="ML classifier not available",
+                        error_code=ErrorCode.ML_MODEL_ERROR,
+                        session_id=session_id,
+                        request_id=request_id
+                    )
+                )
             
+        except HTTPException:
+            raise
         except Exception as e:
             ErrorLogger.log_error(
                 exception=e,
@@ -473,8 +492,16 @@ async def process_customer_query(request: CustomerRequest):
                 request_id=request_id,
                 context={"step": "service_initialization"}
             )
-            # Try graceful degradation
-            return APIResponse(**(await GracefulDegradationHandler.handle_classifier_unavailable(request.utterance)))
+            raise HTTPException(
+                status_code=503,
+                detail=ErrorHandler.create_error_response(
+                    status_code=503,
+                    message="Service temporarily unavailable",
+                    error_code=ErrorCode.SERVICE_UNAVAILABLE,
+                    session_id=session_id,
+                    request_id=request_id
+                )
+            )
         
         # 3. Classify Request
         try:
@@ -546,8 +573,16 @@ async def process_customer_query(request: CustomerRequest):
                 request_id=request_id,
                 context={"step": "classification", "utterance_length": len(request.utterance)}
             )
-            # Try graceful degradation
-            return APIResponse(**(await GracefulDegradationHandler.handle_classifier_unavailable(request.utterance)))
+            raise HTTPException(
+                status_code=500,
+                detail=ErrorHandler.create_error_response(
+                    status_code=500,
+                    message=ErrorHandler.get_user_friendly_message(ErrorCode.CLASSIFICATION_FAILED),
+                    error_code=ErrorCode.CLASSIFICATION_FAILED,
+                    session_id=session_id,
+                    request_id=request_id
+                )
+            )
         
         # 4. Create Request Context
         request_context = RequestContext(
@@ -618,23 +653,17 @@ async def process_customer_query(request: CustomerRequest):
                 }
             )
             
-            # Try graceful degradation based on request type
-            try:
-                return APIResponse(**(await GracefulDegradationHandler.handle_api_unavailable(
-                    classification_result.request_type.value
-                )))
-            except Exception:
-                # Final fallback
-                raise HTTPException(
+            # Workflow failed - return error
+            raise HTTPException(
+                status_code=500,
+                detail=ErrorHandler.create_error_response(
                     status_code=500,
-                    detail=ErrorHandler.create_error_response(
-                        status_code=500,
-                        message=ErrorHandler.get_user_friendly_message(ErrorCode.WORKFLOW_FAILED),
-                        error_code=ErrorCode.WORKFLOW_FAILED,
-                        session_id=session_id,
-                        request_id=request_id
-                    )
+                    message=ErrorHandler.get_user_friendly_message(ErrorCode.WORKFLOW_FAILED),
+                    error_code=ErrorCode.WORKFLOW_FAILED,
+                    session_id=session_id,
+                    request_id=request_id
                 )
+            )
         
         # 6. Format and Return Response
         if workflow_result.success:
@@ -814,144 +843,18 @@ async def process_customer_query(request: CustomerRequest):
             success=False
         )
         
-        # Try final graceful degradation
-        try:
-            return APIResponse(**(await GracefulDegradationHandler.handle_classifier_unavailable(request.utterance)))
-        except Exception:
-            # Absolute final fallback
-            raise HTTPException(
+        # Final error - no fallback
+        raise HTTPException(
+            status_code=500,
+            detail=ErrorHandler.create_error_response(
                 status_code=500,
-                detail=ErrorHandler.create_error_response(
-                    status_code=500,
-                    message=ErrorHandler.get_user_friendly_message(ErrorCode.INTERNAL_ERROR),
-                    error_code=ErrorCode.INTERNAL_ERROR,
-                    session_id=session_id,
-                    request_id=request_id if 'request_id' in locals() else None
-                )
+                message=ErrorHandler.get_user_friendly_message(ErrorCode.INTERNAL_ERROR),
+                error_code=ErrorCode.INTERNAL_ERROR,
+                session_id=session_id,
+                request_id=request_id if 'request_id' in locals() else None
             )
-
-
-@app.post("/api/v1/customer-service/query/simple", response_model=APIResponse)
-async def process_customer_query_simple(request: CustomerRequest):
-    """
-    Simple customer query processing (original implementation for comparison)
-    """
-    try:
-        logger.info("Processing simple customer query", utterance=request.utterance)
-        
-        # Get classifier from container with graceful degradation
-        if not container.is_initialized():
-            logger.warning("Service container not initialized, using fallback")
-            return APIResponse(**(await GracefulDegradationHandler.handle_classifier_unavailable(request.utterance)))
-        
-        classifier = container.get_classifier()
-        
-        if not classifier.is_loaded():
-            logger.warning("Classifier not loaded, using graceful degradation")
-            return APIResponse(**(await GracefulDegradationHandler.handle_classifier_unavailable(request.utterance)))
-        
-        # 1. Classify request using ML model
-        classification_result = await classifier.classify_request(request.utterance)
-        
-        # 2. Extract entities (already done in classifier)
-        entities = classification_result.extracted_entities
-        
-        # 3. Create response based on classification
-        intent = classification_result.request_type
-        confidence = classification_result.confidence
-        
-        # Generate appropriate response based on intent
-        if intent == "cancel_trip":
-            message = "I can help you cancel your flight. To proceed with the cancellation, I'll need your booking reference (PNR) or flight details."
-            if entities:
-                pnr_entities = [e for e in entities if e.type == "pnr"]
-                if pnr_entities:
-                    pnr = pnr_entities[0].value
-                    message = f"I found your booking reference {pnr}. I can help you cancel this flight. Please note that cancellation fees may apply based on your fare type."
-        
-        elif intent == "flight_status":
-            message = "I can check your flight status. Let me look up the current information for your flight."
-            if entities:
-                flight_entities = [e for e in entities if e.type == "flight_number"]
-                pnr_entities = [e for e in entities if e.type == "pnr"]
-                if flight_entities:
-                    flight = flight_entities[0].value
-                    message = f"Checking status for flight {flight}. Your flight is currently on time with no delays reported."
-                elif pnr_entities:
-                    pnr = pnr_entities[0].value
-                    message = f"Checking status for booking {pnr}. Your flight is currently on time with no delays reported."
-        
-        elif intent == "seat_availability":
-            message = "I can show you available seats on your flight. Let me check the current seat map."
-            if entities:
-                class_entities = [e for e in entities if e.type == "class"]
-                seat_type_entities = [e for e in entities if e.type == "seat_type"]
-                if class_entities:
-                    seat_class = class_entities[0].value
-                    message = f"Checking available seats in {seat_class} class. I found several options for you."
-                elif seat_type_entities:
-                    seat_type = seat_type_entities[0].value
-                    message = f"Looking for {seat_type} seats. I found several {seat_type} seats available."
-        
-        elif intent == "cancellation_policy":
-            message = "Our cancellation policy varies by fare type. Generally, you can cancel flights up to 24 hours before departure. Fees may apply depending on your ticket type."
-        
-        elif intent == "pet_travel":
-            message = "I can help you with pet travel information. Small pets can travel in the cabin in approved carriers, while larger pets may need to travel as cargo. Service animals are always welcome."
-            if entities:
-                pet_entities = [e for e in entities if e.type == "pet_type"]
-                if pet_entities:
-                    pet_type = pet_entities[0].value
-                    message = f"For {pet_type} travel, specific requirements apply. Small {pet_type}s can travel in cabin with proper carriers."
-        
-        else:
-            message = "I understand you need assistance. Could you please provide more details about what you'd like to help with?"
-        
-        # 4. Return formatted response
-        return APIResponse(
-            status="completed",
-            message=message,
-            data={
-                "intent": intent.value,
-                "confidence": confidence,
-                "entities": [
-                    {
-                        "type": entity.type.value,
-                        "value": entity.value,
-                        "confidence": entity.confidence
-                    } for entity in entities
-                ],
-                "alternatives": [
-                    {
-                        "intent": alt["type"].value,
-                        "confidence": alt["confidence"]
-                    } for alt in classification_result.alternative_intents
-                ]
-            }
         )
-        
-    except Exception as e:
-        ErrorLogger.log_error(
-            exception=e,
-            error_code=ErrorCode.INTERNAL_ERROR,
-            context={
-                "endpoint": "simple",
-                "utterance_length": len(request.utterance)
-            }
-        )
-        
-        # Try graceful degradation
-        try:
-            return APIResponse(**(await GracefulDegradationHandler.handle_classifier_unavailable(request.utterance)))
-        except Exception:
-            raise HTTPException(
-                status_code=500,
-                detail=ErrorHandler.create_error_response(
-                    status_code=500,
-                    message=ErrorHandler.get_user_friendly_message(ErrorCode.INTERNAL_ERROR),
-                    error_code=ErrorCode.INTERNAL_ERROR
-                )
-            )
+
 
 
 # Request logging middleware
@@ -1007,7 +910,6 @@ async def not_found_handler(request, exc):
                     "GET /health",
                     "GET /api/v1/status", 
                     "POST /api/v1/customer-service/query",
-                    "POST /api/v1/customer-service/query/simple",
                     "GET /api/v1/metrics",
                     "GET /api/v1/metrics/summary"
                 ]

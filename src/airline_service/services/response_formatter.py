@@ -35,6 +35,11 @@ class ResponseFormatter:
             RequestType.CANCELLATION_POLICY: self._build_policy_response,
             RequestType.PET_TRAVEL: self._build_policy_response,
         }
+        
+        # Special response builders for specific response formats
+        self.format_builders = {
+            ResponseFormat.BOOKING_CONFIRMATION: self._build_booking_confirmation_response,
+        }
     
     def format_response(
         self, 
@@ -347,6 +352,76 @@ class ResponseFormatter:
             formatted_data
         )
     
+    def _build_booking_confirmation_response(
+        self, 
+        data: Union[BookingDetails, Dict[str, Any]], 
+        message: Optional[str] = None
+    ) -> APIResponse:
+        """Build response for booking confirmation before cancellation."""
+        if isinstance(data, BookingDetails):
+            formatted_data = {
+                "pnr": data.pnr,
+                "flight_number": getattr(data, 'flight_number', f"Flight {data.flight_id}"),
+                "route": {
+                    "from": data.source_airport_code,
+                    "to": data.destination_airport_code
+                },
+                "scheduled_departure": data.scheduled_departure.isoformat(),
+                "scheduled_arrival": data.scheduled_arrival.isoformat(),
+                "assigned_seat": getattr(data, 'assigned_seat', None),
+                "fare_type": getattr(data, 'fare_type', 'Standard'),
+                "confirmation_required": True
+            }
+            
+            default_message = (
+                f"I found your booking {data.pnr} for flight from {data.source_airport_code} "
+                f"to {data.destination_airport_code} on {data.scheduled_departure.strftime('%Y-%m-%d')}. "
+                f"Would you like me to proceed with the cancellation?"
+            )
+            
+        else:
+            # Handle dictionary data
+            formatted_data = data
+            formatted_data["confirmation_required"] = True
+            default_message = "Please confirm the booking details before proceeding with cancellation."
+        
+        return self.create_completed_response(
+            message or default_message,
+            formatted_data
+        )
+    
+    def format_response_by_format(
+        self, 
+        response_format: ResponseFormat, 
+        data: Any, 
+        message: Optional[str] = None
+    ) -> APIResponse:
+        """
+        Format response by specific response format type.
+        
+        Args:
+            response_format: The specific response format to use
+            data: The response data to format
+            message: Optional custom message
+            
+        Returns:
+            Formatted APIResponse object
+        """
+        try:
+            builder = self.format_builders.get(response_format)
+            if builder:
+                return builder(data, message)
+            else:
+                # Fall back to generic response
+                return self._build_generic_response(data, message)
+                
+        except Exception as e:
+            logger.error(f"Error formatting response for format {response_format}: {str(e)}")
+            return self.create_error_response(
+                "Failed to format response",
+                "FORMATTING_ERROR"
+            )
+    
     def _handle_api_error(self, error: APIError) -> APIResponse:
         """Handle API-specific errors with appropriate messages."""
         if error.status_code == 404:
@@ -481,3 +556,35 @@ class AutomatedResponseBuilder:
                 ]
             }
         )
+    
+    def format_response_by_format(
+        self, 
+        response_format: ResponseFormat, 
+        data: Any, 
+        message: Optional[str] = None
+    ) -> APIResponse:
+        """
+        Format response by specific response format type.
+        
+        Args:
+            response_format: The specific response format to use
+            data: The response data to format
+            message: Optional custom message
+            
+        Returns:
+            Formatted APIResponse object
+        """
+        try:
+            builder = self.format_builders.get(response_format)
+            if builder:
+                return builder(data, message)
+            else:
+                # Fall back to generic response
+                return self._build_generic_response(data, message)
+                
+        except Exception as e:
+            logger.error(f"Error formatting response for format {response_format}: {str(e)}")
+            return self.create_error_response(
+                "Failed to format response",
+                "FORMATTING_ERROR"
+            )

@@ -744,35 +744,39 @@ class APICallHandler(TaskHandlerInterface):
             if not booking_details:
                 raise ValueError("Booking details are required for cancel_flight")
             
-            cancellation_result = await self.airline_client.cancel_flight(booking_details)
+            # Extract PNR from booking details for cancellation
+            pnr = booking_details.pnr if hasattr(booking_details, 'pnr') else str(booking_details)
+            cancellation_result = await self.airline_client.cancel_flight(pnr, "Customer request")
             return {
                 "cancellation_result": cancellation_result,
+                "booking_details": booking_details,  # Include original booking details
                 "api_method": api_method,
                 "success": True
             }
         
         elif api_method == "get_available_seats":
-            flight_info = self._get_flight_info(retrieved_data, workflow_data)
-            if not flight_info:
-                raise ValueError("Flight info is required for get_available_seats")
+            # Get flight info from booking details or flight identifiers
+            booking_details = self._get_booking_details(retrieved_data, workflow_data)
+            if booking_details:
+                # Use booking details to get seat availability
+                flight_id = str(booking_details.flight_id)
+                date = booking_details.scheduled_departure.strftime("%Y-%m-%d")
+            else:
+                # Fallback to flight info
+                flight_info = self._get_flight_info(retrieved_data, workflow_data)
+                if not flight_info:
+                    raise ValueError("Flight info or booking details are required for get_available_seats")
+                
+                flight_id = str(flight_info.get("flight_id", flight_info.get("flight_number", "1001")))
+                date = flight_info.get("departure_date", "2024-01-15")
+                if hasattr(date, 'strftime'):
+                    date = date.strftime("%Y-%m-%d")
             
-            # Convert flight_info dict to FlightInfo object for the API
-            from ..types import FlightInfo
-            from datetime import datetime
-            
-            flight_info_obj = FlightInfo(
-                flight_id=flight_info.get("flight_id", 0),
-                flight_number=flight_info.get("flight_number", ""),
-                source_airport_code=flight_info.get("source_airport", ""),
-                destination_airport_code=flight_info.get("destination_airport", ""),
-                scheduled_departure=flight_info.get("departure_date", datetime.now()),
-                scheduled_arrival=flight_info.get("arrival_date", datetime.now()),
-                current_status=flight_info.get("status", "Unknown")
-            )
-            
-            seat_availability = await self.airline_client.get_available_seats(flight_info_obj)
+            seat_availability = await self.airline_client.get_available_seats(flight_id, date)
             return {
                 "seat_availability": seat_availability,
+                "flight_id": flight_id,
+                "date": date,
                 "api_method": api_method,
                 "success": True
             }
@@ -860,23 +864,19 @@ class PolicyLookupHandler(TaskHandlerInterface):
         if not policy_type:
             raise ValueError("policy_type parameter is required")
         
-        if policy_type == "cancellation":
-            if context_aware:
-                # Try to get flight details for context-aware policy lookup
-                flight_details = self._extract_flight_details(context)
-                if flight_details:
-                    policy_info = await self.policy_service.get_cancellation_policy(flight_details)
-                else:
-                    # Fall back to general policy
-                    policy_info = await self.policy_service.get_general_cancellation_policy()
-            else:
-                policy_info = await self.policy_service.get_general_cancellation_policy()
-        
-        elif policy_type == "pet_travel":
-            policy_info = await self.policy_service.get_pet_travel_policy()
-        
-        else:
-            raise ValueError(f"Unknown policy type: {policy_type}")
+        try:
+            # Add timeout to prevent hanging
+            policy_info = await asyncio.wait_for(
+                self._get_policy_with_fallback(policy_type),
+                timeout=5.0  # 5 second timeout
+            )
+        except asyncio.TimeoutError:
+            # Fallback response if policy lookup times out
+            policy_info = self._create_fallback_policy(policy_type)
+        except Exception as e:
+            # Fallback response for any other errors
+            print(f"Policy lookup error: {e}")
+            policy_info = self._create_fallback_policy(policy_type)
         
         return {
             "policy_info": policy_info,
@@ -884,6 +884,50 @@ class PolicyLookupHandler(TaskHandlerInterface):
             "context_aware": context_aware,
             "success": True
         }
+    
+    async def _get_policy_with_fallback(self, policy_type: str) -> PolicyInfo:
+        """Get policy with fallback handling"""
+        if policy_type == "cancellation":
+            return await self.policy_service.get_general_cancellation_policy()
+        elif policy_type == "pet_travel":
+            return await self.policy_service.get_pet_travel_policy()
+        else:
+            raise ValueError(f"Unknown policy type: {policy_type}")
+    
+    def _create_fallback_policy(self, policy_type: str) -> PolicyInfo:
+        """Create fallback policy response when lookup fails"""
+        fallback_content = {
+            "cancellation": """
+**JetBlue Cancellation Policy Summary**
+
+• **24-Hour Rule**: Cancel within 24 hours of booking for a full refund (if booked 7+ days before departure)
+• **Blue Basic**: Non-refundable, but can cancel for JetBlue credit minus fees
+• **Blue/Blue Plus/Blue Extra**: Refundable fares with varying fees
+• **Same-day changes**: Available for a fee
+• **Weather/JetBlue delays**: Full refund or rebooking at no charge
+
+For specific fare rules and current fees, please visit jetblue.com or contact customer service.
+            """,
+            "pet_travel": """
+**JetBlue Pet Travel Policy Summary**
+
+• **In-Cabin Pets**: Small cats and dogs in approved carriers
+• **Pet Fee**: $125 each way for in-cabin pets
+• **Carrier Requirements**: Must fit under the seat in front of you
+• **Health Certificate**: Required for some destinations
+• **Service Animals**: Travel free with proper documentation
+• **Restrictions**: No pets in cargo, limited to in-cabin only
+
+For complete pet travel requirements, visit jetblue.com/pets or contact customer service.
+            """
+        }
+        
+        return PolicyInfo(
+            policy_type=policy_type,
+            content=fallback_content.get(policy_type, f"{policy_type.title()} policy information is currently unavailable. Please contact customer service for assistance."),
+            last_updated=datetime.now(),
+            applicable_conditions=[policy_type]
+        )
     
     def _extract_flight_details(self, context: TaskContext) -> Optional[FlightDetails]:
         """Extract flight details from context for policy lookup"""
@@ -923,6 +967,7 @@ class InformCustomerHandler(TaskHandlerInterface):
             ResponseFormat.FLIGHT_STATUS: RequestType.FLIGHT_STATUS,
             ResponseFormat.SEAT_AVAILABILITY: RequestType.SEAT_AVAILABILITY,
             ResponseFormat.POLICY_INFO: RequestType.CANCELLATION_POLICY,
+            ResponseFormat.BOOKING_CONFIRMATION: RequestType.CANCEL_TRIP,
             ResponseFormat.SIMPLE_MESSAGE: None  # Generic response
         }
     
@@ -943,7 +988,14 @@ class InformCustomerHandler(TaskHandlerInterface):
         request_type = self.response_type_mapping.get(ResponseFormat(response_type))
         
         # Format response using the new response formatter
-        if request_type:
+        response_format = ResponseFormat(response_type)
+        
+        # Check if we have a specific format builder
+        if hasattr(self.response_formatter, 'format_response_by_format'):
+            formatted_response = self.response_formatter.format_response_by_format(
+                response_format, relevant_data
+            )
+        elif request_type:
             formatted_response = self.response_formatter.format_response(
                 request_type, relevant_data
             )

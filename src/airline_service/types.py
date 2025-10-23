@@ -49,6 +49,7 @@ class ResponseFormat(str, Enum):
     CANCELLATION_RESULT = "cancellation_result"
     SEAT_AVAILABILITY = "seat_availability"
     POLICY_INFO = "policy_info"
+    BOOKING_CONFIRMATION = "booking_confirmation"
 
 
 # Request and Response Models
